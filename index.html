@@ -579,7 +579,7 @@ let hardMode = false;
 
 // Bumped by one on every exported build so a stale cached copy is always
 // visually distinguishable from the latest version.
-const GAME_VERSION = 88;
+const GAME_VERSION = 89;
 
 // ---------- Art style palette ----------
 // Solid-shape earth-tone style: natural ground colors, dark grey unit hulls,
@@ -2548,6 +2548,14 @@ genTrees(terrainSeed);
 // - a mechanic trees don't have at all.
 // ---------------------------------------------------------------------------
 let buildings = [];
+// Real data record of every crater ever created, not just the pixels
+// painted onto the persistent damage layer (see paintTerrainDamage/
+// spawnExplosion) - needed so gameplay logic (Detection Range, stealth
+// concealment) can query "is this unit inside a crater" the same way it
+// already queries buildings/trees, rather than a crater being purely
+// decorative. Craters never expire or get removed, matching how the visual
+// scorch marks themselves are permanent once painted.
+let craters = [];
 const BUILDING_MAX_HP = 640; // doubled from 320 per request - several explosions' worth even before doubling (LRM Mech's splash or Artillery would each take multiple direct hits to bring one down), now taking meaningfully longer to reduce to rubble
 // Damage-state thresholds as fractions of maxHp - FOUR states now (normal/
 // slight/extensive/destroyed), replacing the old two-state (normal/
@@ -2629,6 +2637,7 @@ function genBuildingFootprint(shape, rnd) {
 function genBuildings(seedValue) {
 
   buildings = [];
+  craters = []; // fresh map, no battle damage yet
   // roads is intentionally NOT reset here anymore - it's now populated by
   // genTerrain (which runs before this function) as part of the road-grid-
   // first design, and this function reads from it (see pickRoadsideSpot)
@@ -4663,7 +4672,19 @@ function findNearestEnemyInSight(t) {
     // frame by the targetUnreachable check, forever, instead of ever
     // considering a farther target it could actually hit.
     if (t.minRange && d < t.minRange) return;
-    if (d <= t.sight && d<bd && !lineBlockedByMountain(t.x,t.y,e.x,e.y)) {
+    // Detection Range: when the target is an Infantry-class unit sitting in
+    // a crater or building, its own detection radius REPLACES this
+    // observer's sight radius for the purposes of spotting it specifically -
+    // "Detection range supersedes the view range of the enemy unit" - so a
+    // unit with a much longer sight stat still can't see it from further
+    // than 100/150px away, and (just as importantly) a unit that would
+    // otherwise be too far to ever see it at all still CAN, once within
+    // that tighter radius, rather than Detection Range only ever narrowing
+    // visibility and never being checked as an independent radius of its
+    // own.
+    const detectionRange = getDetectionRangeFor(e);
+    const effectiveSight = detectionRange !== null ? detectionRange : t.sight;
+    if (d <= effectiveSight && d<bd && !lineBlockedByMountain(t.x,t.y,e.x,e.y)) {
       bd = d; best = e;
     }
   });
@@ -6523,6 +6544,14 @@ function spawnExplosion(x, y, radius, treeDamage) {
   // This is independent of the explosion's own short-lived shockwave/debris/
   // smoke effects below - those fade out in seconds, this never does.
   paintTerrainDamage(x, y, radius);
+  // Real data record alongside the visual paint - Detection Range and the
+  // stealth-concealment dwell timer both need to query "is this unit
+  // standing in a crater" as actual gameplay state, not just pixels. Uses
+  // the same radius the visual mark itself is sized from (see
+  // paintTerrainDamage, which draws at roughly radius*2.6 diameter), so a
+  // unit only counts as "in" the crater across about the same area the
+  // scorch mark visibly covers, not the much smaller literal impact point.
+  craters.push({ x, y, radius: radius*1.3 });
 
   // Trees are only destructible by explosive weapon fire (this function is
   // only ever called for an actual explosion - a splash-weapon impact or a
@@ -7246,6 +7275,41 @@ function updateBuildingOccupancy() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Detection Range: a distinct mechanic from both concealment systems below -
+// "Infantry class units [Infantry, AT Infantry, Sappers] will have a
+// Detection Range - the range they become visible to the enemy depending on
+// where they are on the map. Detection range supersedes the view range of
+// the enemy unit." Unlike isConcealedFrom/isStealthConcealedFrom (which are
+// binary hidden/not-hidden), this returns an actual DISTANCE that overrides
+// the observer's own sight radius for this one target - "even if they fire
+// or move" makes clear this applies unconditionally whenever the unit is in
+// one of these two locations, with no dwell timer and no break-on-fire/move
+// exception (that's the SEPARATE crater-stealth addition further below).
+// Returns null when the unit isn't standing in a qualifying location at all,
+// meaning normal sight rules apply with no override.
+function getDetectionRangeFor(t) {
+  if (!INFANTRY_CLASS_TYPES.has(t.unitType)) return null;
+  // Crater or a fully-destroyed building's rubble: 100px, the tightest
+  // tier - "cannot be seen... if there is no enemy within 100 pixels".
+  // Checked first since a destroyed building and a crater sitting in
+  // roughly the same spot (a building destroyed by the same blast that
+  // scarred the ground around it) should both grant the tighter radius,
+  // not have the wider building-rubble check silently shadow it.
+  if (craters.some(c => Math.hypot(t.x-c.x, t.y-c.y) <= c.radius)) return 100;
+  for (const b of buildings) {
+    const footprintExtent = b.footprint.cellSize * Math.max(2, Math.sqrt(b.footprint.cells.length)) * 0.6;
+    if (Math.hypot(t.x-b.x, t.y-b.y) > footprintExtent) continue;
+    // "in a crater or destroyed building" (100px) vs. "in a building that
+    // is not completely destroyed" (150px) - getBuildingDamageState is the
+    // same 4-tier classifier the building's own visible sprite/HP already
+    // use, so this tracks the building's actual current state exactly
+    // rather than a separate approximation of it.
+    return getBuildingDamageState(b) === 'destroyed' ? 100 : 150;
+  }
+  return null;
+}
+
 // True if `target` is currently concealed from `observer`'s team - i.e.
 // target is Infantry or Scout sheltering inside a building's footprint
 // (living OR destroyed - rubble still provides cover), hidden from every
@@ -7335,6 +7399,16 @@ function isTouchingTreeOrBuilding(t) {
   for (const e of entities) {
     if (!e.alive || e.kind!=='tank' || !CONCEALING_UNIT_TYPES.has(e.unitType)) continue;
     if (Math.hypot(t.x-e.x, t.y-e.y) <= t.radius + e.radius + 4) return true;
+  }
+  // "As per current rules, Infantry class units inside a building... go
+  // completely invisible... I'd like to add this ability when they are in
+  // a crater" - a crater grants the same 5-second-stillness-to-vanish
+  // ability trees/buildings/Blockhouse/Foxhole already do. Uses the same
+  // crater records Detection Range itself reads (see getDetectionRangeFor),
+  // so "standing in the crater" means the same physical area for both
+  // mechanics rather than two slightly different definitions of it.
+  for (const c of craters) {
+    if (Math.hypot(t.x-c.x, t.y-c.y) <= c.radius) return true;
   }
   return false;
 }
@@ -8766,7 +8840,22 @@ function render() {
   // are deliberately NOT hidden this way - a player should always be able
   // to see and manage their own units regardless of concealment state; only
   // the enemy's concealment should affect what's drawn.
-  const visibleTanks = entities.filter(e=>e.kind==='tank' && e.alive && (e.team==='blue' || (isVisible(e.x,e.y) && !e.stealthConcealed)));
+  // Detection Range applies here too, for the same reason stealthConcealed
+  // does: a unit hidden from the AI's targeting but still fully visible to
+  // the player on screen would be a strange, inconsistent experience - "the
+  // range they become visible to the enemy" reads as governing whether the
+  // enemy can perceive the unit at all, not just whether the AI's own
+  // targeting logic happens to pick it as a target. Only relevant while the
+  // tile itself is fog-visible in the first place (isVisible) - Detection
+  // Range narrows visibility further, it never grants sight through fog a
+  // unit wouldn't otherwise have.
+  function withinAnyEnemyDetectionRange(e) {
+    const range = getDetectionRangeFor(e);
+    if (range === null) return true; // no override active - ordinary fog visibility governs
+    const oppTeam = e.team==='blue' ? 'red' : 'blue';
+    return entities.some(o => o.alive && o.team===oppTeam && (o.kind==='tank'||o.kind==='base') && Math.hypot(o.x-e.x, o.y-e.y) <= range);
+  }
+  const visibleTanks = entities.filter(e=>e.kind==='tank' && e.alive && (e.team==='blue' || (isVisible(e.x,e.y) && !e.stealthConcealed && withinAnyEnemyDetectionRange(e))));
   visibleTanks.filter(t => !INFANTRY_CLASS_TYPES.has(t.unitType)).forEach(drawTank);
   visibleTanks.filter(t => INFANTRY_CLASS_TYPES.has(t.unitType)).forEach(drawTank);
 
