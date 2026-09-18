@@ -579,7 +579,7 @@ let hardMode = false;
 
 // Bumped by one on every exported build so a stale cached copy is always
 // visually distinguishable from the latest version.
-const GAME_VERSION = 89;
+const GAME_VERSION = 90;
 
 // ---------- Art style palette ----------
 // Solid-shape earth-tone style: natural ground colors, dark grey unit hulls,
@@ -1352,13 +1352,34 @@ function damageBlobPath(dctx, cx, cy, baseR, seedFn, irregularity, stretchX, str
 // fairly evenly around it" composition, so without this every crater on
 // the map would additionally repeat the same six fixed orientations,
 // which would be more noticeable than repeating six fixed images alone).
+// Paints one permanent crater mark onto the damage layer at the given
+// WORLD coordinates (not screen coordinates - this canvas is a 1:1 map of
+// the world, independent of camera position/zoom). Called once per
+// explosion (see spawnExplosion), sized off the same blast radius the
+// explosion's own particle burst uses, so bigger weapons leave bigger
+// scars. Picks one of the six real crater images at random per call
+// ("just choose a random one for each explosion") rather than the old
+// procedurally-drawn blob/debris-chip shapes - replaced entirely, not kept
+// as a fallback, since every one of the six real images covers the same
+// visual role (scorch halo + pit + scattered debris) in a single asset.
+// A random rotation is applied per stamp on top of that (the six source
+// images all share a similar "hole roughly centered, debris scattered
+// fairly evenly around it" composition, so without this every crater on
+// the map would additionally repeat the same six fixed orientations,
+// which would be more noticeable than repeating six fixed images alone).
+// Returns the exact draw parameters used (rotation, w, h) so the caller can
+// later erase precisely this same stamp if the crater ages out (see
+// eraseCraterMark/CRATER_CAP in spawnExplosion) - erasing needs to redraw
+// the identical shape/size/orientation, not just clear a plain circle,
+// since the actual painted image has straight spikes/debris that can
+// extend further than a simple circular radius would suggest.
 let damageSeedCounter = 1;
 function paintTerrainDamage(x, y, radius) {
   let seed = (damageSeedCounter += 104729); // large prime step so consecutive craters don't share visibly-correlated shapes
   function rnd(){ seed = (seed*9301+49297)%233280; return seed/233280; }
 
   const key = CRATER_SPRITE_KEYS[Math.floor(rnd()*CRATER_SPRITE_KEYS.length)];
-  if (!craterSpriteReady[key]) return; // hasn't finished decoding yet - skip this one stamp rather than block or throw; exceedingly unlikely in practice since these are tiny (~10KB) images that finish loading well before the first explosion of a real match
+  if (!craterSpriteReady[key]) return null; // hasn't finished decoding yet - skip this one stamp rather than block or throw; exceedingly unlikely in practice since these are tiny (~10KB) images that finish loading well before the first explosion of a real match
   const img = craterSprites[key];
   const aspect = img.naturalWidth / img.naturalHeight;
   // Sized off the same "radius" every caller already passes in (matching
@@ -1369,11 +1390,34 @@ function paintTerrainDamage(x, y, radius) {
   const diameter = radius * 2.6;
   const w = aspect >= 1 ? diameter : diameter*aspect;
   const h = aspect >= 1 ? diameter/aspect : diameter;
+  const rotation = rnd()*Math.PI*2;
 
   damageCtx.save();
   damageCtx.translate(x, y);
-  damageCtx.rotate(rnd()*Math.PI*2);
+  damageCtx.rotate(rotation);
   damageCtx.drawImage(img, -w/2, -h/2, w, h);
+  damageCtx.restore();
+  return { key, rotation, w, h };
+}
+
+// Cuts a previously-painted crater mark back out of the persistent damage
+// layer - the actual cleanup mechanism behind "clean up the craters
+// underneath and only have the top few layers". Re-draws the EXACT SAME
+// sprite/size/rotation the original paint call used, but with
+// globalCompositeOperation 'destination-out', which erases wherever the
+// shape's own opaque pixels are instead of drawing them - so the erased
+// area matches the crater's real jagged silhouette (spikes, scattered
+// debris bits) rather than a plain circle that would either leave ragged
+// leftover fragments outside it or erase a wider clean area than the
+// crater actually painted.
+function eraseCraterMark(c) {
+  if (!c.paint) return; // no paint record (e.g. sprite hadn't loaded when this crater was created) - nothing to erase
+  const img = craterSprites[c.paint.key];
+  damageCtx.save();
+  damageCtx.globalCompositeOperation = 'destination-out';
+  damageCtx.translate(c.x, c.y);
+  damageCtx.rotate(c.paint.rotation);
+  damageCtx.drawImage(img, -c.paint.w/2, -c.paint.h/2, c.paint.w, c.paint.h);
   damageCtx.restore();
 }
 
@@ -2548,14 +2592,20 @@ genTrees(terrainSeed);
 // - a mechanic trees don't have at all.
 // ---------------------------------------------------------------------------
 let buildings = [];
-// Real data record of every crater ever created, not just the pixels
+// Real data record of every currently-tracked crater, not just the pixels
 // painted onto the persistent damage layer (see paintTerrainDamage/
 // spawnExplosion) - needed so gameplay logic (Detection Range, stealth
 // concealment) can query "is this unit inside a crater" the same way it
 // already queries buildings/trees, rather than a crater being purely
-// decorative. Craters never expire or get removed, matching how the visual
-// scorch marks themselves are permanent once painted.
+// decorative. Capped at CRATER_CAP entries (oldest removed first, along
+// with its own visual paint - see eraseCraterMark) rather than growing
+// unboundedly for the rest of the match - a long game can otherwise
+// accumulate hundreds of these, which both slows down the per-unit
+// Detection Range scan (a fresh linear pass over the whole array, run every
+// frame for every Infantry-class unit) and visually piles up ever more
+// overlapping crater sprites on the same patch of ground.
 let craters = [];
+const CRATER_CAP = 40; // "only have the top few layers of craters" - generous enough that recent battle damage in an active area stays meaningful, without letting the list (and the per-frame scan cost that comes with it) grow without bound over a long match
 const BUILDING_MAX_HP = 640; // doubled from 320 per request - several explosions' worth even before doubling (LRM Mech's splash or Artillery would each take multiple direct hits to bring one down), now taking meaningfully longer to reduce to rubble
 // Damage-state thresholds as fractions of maxHp - FOUR states now (normal/
 // slight/extensive/destroyed), replacing the old two-state (normal/
@@ -6543,7 +6593,7 @@ function spawnExplosion(x, y, radius, treeDamage) {
   // damage layer at this exact spot, once, right when the explosion happens.
   // This is independent of the explosion's own short-lived shockwave/debris/
   // smoke effects below - those fade out in seconds, this never does.
-  paintTerrainDamage(x, y, radius);
+  const paint = paintTerrainDamage(x, y, radius);
   // Real data record alongside the visual paint - Detection Range and the
   // stealth-concealment dwell timer both need to query "is this unit
   // standing in a crater" as actual gameplay state, not just pixels. Uses
@@ -6551,7 +6601,29 @@ function spawnExplosion(x, y, radius, treeDamage) {
   // paintTerrainDamage, which draws at roughly radius*2.6 diameter), so a
   // unit only counts as "in" the crater across about the same area the
   // scorch mark visibly covers, not the much smaller literal impact point.
-  craters.push({ x, y, radius: radius*1.3 });
+  // `paint` (the exact sprite/size/rotation used) is kept on the record so
+  // an aged-out crater can be erased with the identical shape later - see
+  // eraseCraterMark/CRATER_CAP below.
+  craters.push({ x, y, radius: radius*1.3, paint });
+  // "When there are too many craters, the game starts to slow down as
+  // there are many craters layered over the top of previous craters. Find
+  // a way to clean up the craters underneath and only have the top few
+  // layers of craters" - a long match can genuinely accumulate hundreds of
+  // these (confirmed directly: ~80 in the first 5 minutes of one AI-only
+  // test match), and since getDetectionRangeFor does a fresh linear scan
+  // over the WHOLE craters array for every Infantry-class unit, every
+  // frame, an ever-growing unbounded list means that per-frame cost keeps
+  // climbing for the rest of the match, on top of the visual layering cost
+  // of stacking ever more overlapping sprite stamps into the same damage
+  // canvas. Capping the list and erasing the oldest entry's own paint the
+  // moment a new one pushes past the cap keeps both costs bounded
+  // regardless of how long the match runs, while still leaving a
+  // reasonable number of recent craters genuinely visible and functional
+  // for Detection Range.
+  if (craters.length > CRATER_CAP) {
+    const oldest = craters.shift();
+    eraseCraterMark(oldest);
+  }
 
   // Trees are only destructible by explosive weapon fire (this function is
   // only ever called for an actual explosion - a splash-weapon impact or a
